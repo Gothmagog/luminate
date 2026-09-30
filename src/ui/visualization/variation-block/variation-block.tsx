@@ -1,7 +1,7 @@
 import React, { useCallback, useState } from "react"
 import './variation-block.scss';
 import { DimensionLabel } from "../dimension-label/dimension-label";
-import { Bookmark, AutoAwesome } from "@mui/icons-material";
+import { Bookmark, AutoAwesome, ContentCopy, Check } from "@mui/icons-material";
 import useCurrStore from "../../../store/use-curr-store";
 import useResponseStore from "../../../store/use-response-store";
 import useDimStore from "../../../store/use-dim-store";
@@ -31,15 +31,13 @@ export const VariationBlock = ({ block, zoom, color, scaleIn }) => {
   const onClickHandler = (block: any) => {
     // if the current block in the editedMap is true, add a new block; otherwise, simply set selected response and response id
     if (editedMap[currBlockId]) { // the block is edited
-      const pattern = /Prompt: (.*?)\n####/s;
-      const match = block["Prompt"].match(pattern);
-
-      let prompt = "";
-      if (match && match[0]) {
-        prompt = match[0].substring(8, match[0].length - 5);
-      } else {
-        prompt = "Prompt not found.";
-        console.log("[Error]", "Fail to extract prompt.");
+      // Use the stored UserPrompt when available (new nodes).
+      // Fall back to the old regex extraction for nodes generated before this field existed.
+      let prompt: string = block['UserPrompt'] || '';
+      if (!prompt) {
+        const pattern = /Writing prompt: (.*?)(?:\n\n|$)/s;
+        const match = (block['Prompt'] as string)?.match(pattern);
+        prompt = match ? match[1].trim() : (block['Prompt'] || 'Prompt not found.');
       }
 
       const blockToAdd = {
@@ -57,13 +55,11 @@ export const VariationBlock = ({ block, zoom, color, scaleIn }) => {
 
       setSelectedResponse(currBlockId, block);
       setResponseId(block.ID);
-      editedMap[currBlockId] = false; //since new block is added, set the editedMap to false
-      console.log("edited map blcok ID", block.ID);
+      editedMap[currBlockId] = false;
       
     } else { // the block is not edited
       setSelectedResponse(currBlockId, block);
       setResponseId(block.ID);
-      console.log("edited map blcok ID", block.ID);
     }
 
   };
@@ -221,6 +217,38 @@ export const VariationBlock = ({ block, zoom, color, scaleIn }) => {
   }
 };
 
+const CopyButton = ({ text }: { text: string }) => {
+  const [copied, setCopied] = useState(false);
+
+  const handleCopy = (e: React.MouseEvent) => {
+    e.stopPropagation(); // don't trigger the block's click-to-select handler
+    const content = text ?? '';
+    navigator.clipboard.writeText(content).then(() => {
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    }).catch(() => {
+      // fallback for contexts where the Clipboard API is unavailable
+      const el = document.createElement('textarea');
+      el.value = content;
+      document.body.appendChild(el);
+      el.select();
+      document.execCommand('copy');
+      document.body.removeChild(el);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    });
+  };
+
+  return (
+    <button onClick={handleCopy} title="Copy to clipboard">
+      {copied
+        ? <Check style={{ color: '#2ECC71', width: '20px', height: '20px' }} />
+        : <ContentCopy style={{ color: '#777', width: '20px', height: '20px' }} />
+      }
+    </button>
+  );
+};
+
 const DetailsFooter = ({block, loadingMore, setLoadingMore, onBookmarkHandler, onClickHandler, onSelectedHandler, nodeMap, setNodeMap}) => (
   <div className="details-footer">
     <button onClick={() => {
@@ -242,6 +270,7 @@ const DetailsFooter = ({block, loadingMore, setLoadingMore, onBookmarkHandler, o
         </div>
       }
     </button>
+    <CopyButton text={block.Result} />
     <button onClick={() => onBookmarkHandler(block)} style={{
       background: block.IsMyFav ? '#1b1b1b99' : '',
     }}>

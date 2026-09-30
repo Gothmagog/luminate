@@ -35,25 +35,6 @@ export default class AiInlineTool {
     }
 
     handleResponseFromAiForm = (response) => {
-        // Check if the Editor.js instance is available
-        try{
-            const blockToAdd = {
-                type: 'AiTool', 
-                data: {
-                  text: response.text,
-                  id: response.id,
-                  query: response.query,
-                  aiPanelRef: response.aiPanelRef
-                }
-            };
-            // set block style that the background color is light blue
-            this.blockIndex = this.api.blocks.getCurrentBlockIndex()
-            this.api.blocks.insert(blockToAdd.type, blockToAdd.data, null, this.blockIndex? this.blockIndex : this.api.blocks.getBlocksCount());
-
-        }
-        catch (error) {
-            console.log("[Error] when loading inline toolbar", error);
-        }
     };
 
     surround(range) {

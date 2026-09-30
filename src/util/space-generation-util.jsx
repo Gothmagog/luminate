@@ -1,693 +1,707 @@
 import useCurrStore from "../store/use-curr-store";
 import useResponseStore from "../store/use-response-store";
-import useEditorStore from "../store/use-editor-store";
 import DatabaseManager from "../db/database-manager";
 import useSelectedStore from "../store/use-selected-store";
 import * as bootstrap from 'bootstrap';
-import { uuid, getEnvVal } from "./util";
-import { generateCategoricalDimensions, validateFormatForDimensions } from "./gpt-util";
+import { uuid } from "./util";
+import { callBedrock, callBedrockStructured } from "./bedrock-client";
+import { getEditorContext } from "./story-context";
+import {
+  CREATIVE_WRITING_SYSTEM_PROMPT,
+  SUMMARIZATION_SYSTEM_PROMPT,
+  LABEL_SYSTEM_PROMPT,
+} from "./prompts";
 
-const DELIMITER = "####";
-const MAX_TOKEN_BIG = 3500;
-const MAX_TOKEN_SMALL = 1000;
-const MODEL = "gpt-3.5-turbo-instruct";
-const TEMPERATURE = 0.7;
-const TOP_P = 1;
-
+// ─── Module-level counters (legacy — kept for callers that read them) ─────────
 let fail_count = 0;
 let total_count = 0;
 let firstId = '';
 
-async function editorBackgroundPrompt() {
-    let context=""; // FIXME: unknown context
-    const {api} = useEditorStore.getState();
-    const ejData = await api.save();
-    // get the last block
-    let prevContext;
-    if (ejData.blocks.length === 0 ){
-        prevContext = "";
-    } else {
-        prevContext = ejData.blocks[ejData.blocks.length - 1].data.text;
-    }
-    let background = "";
-    if (prevContext != "" && context != ""){
-        background = `(${prevContext}) AND (${context})`;
-    } else if (prevContext != "" && context == ""){
-        background = prevContext;
-    } else if (prevContext == "" && context != ""){
-        background = context;
-    }
-    return background !== "" ? "This is the context:\n" + background + "\n---end context ---\n\n" : "";
-}
+// ─── Helpers ──────────────────────────────────────────────────────────────────
 
-/*  
-    for each dimension, randomly choose a value
-    if the dimension is categorical, choose a value from the list
-    if the dimension is continuous, choose a value from the range
-    concatenate the values into a string
-    concatenate the string with the prompt
-    use the OpenAI API to generate a response 
-*/
-export async function buildSpace(currBlockId, dimensions, numResponses, prompt, context){
-    let { dimReqs, data } = genDimRequirements(dimensions, numResponses);
-    const { api } = useEditorStore.getState();
-    const { maxBlockId, setMaxBlockId } = useCurrStore.getState();
-    const { setSelectedResponse } = useSelectedStore.getState();
-
-    let fail_count = 0;
-    let total_count = dimReqs.length;
-    const processResponses = async (reqs) => {
-        return Promise.all(reqs.map(async (req) => {
-            try {
-                const id = req["ID"];
-                const wordLimit = "Limit the response to 150 words.\n####\n";
-                const requirements = req["Requirements"];
-                const message = `${wordLimit}${editorBackgroundPrompt()} Prompt: ${prompt}\n####\nRequirements: ${requirements}`;
-                const response = await generateResponse(message);
-                const trimmedResponse = response.trim();
-                const summary = await abstraction(trimmedResponse);
-
-                if (id === useResponseStore.getState().responseId){
-                    useResponseStore.getState().setResponse(response);
-                }
-
-                // Update the data object for each requirement
-                data[id] = {
-                    ...data[id],
-                    Prompt: message,
-                    Context: context,
-                    Result: trimmedResponse,
-                    IsMyFav: false,
-                    Summary: summary["Summary"],
-                    Keywords: summary["Key Words"],
-                    Structure: summary["Structure"],
-                    Title: summary["Title"],
-                };
-                // Handle selected response logic as per your application's needs
-                if (id === firstId) {
-                    setSelectedResponse(currBlockId, data[id]);
-                }
-                return data[id];
-            } catch (error) {
-                console.error(`Error processing response for ID ${req["ID"]}:`, error);
-                fail_count++;
-                return null; // or handle as appropriate for your error management
-            }
-        }));
-    };
-
-    const batchSize = 20;
-    for (let i = 0; i < dimReqs.length; i += batchSize) {
-        const batch = dimReqs.slice(i, i + batchSize);
-        await processResponses(batch);
-    }
-
-    // Store the responses and update state
-    DatabaseManager.putAllData(currBlockId, data);
-    const setCurrBlockId = useCurrStore.getState().setCurrBlockId;
-    setCurrBlockId(currBlockId);
-    setMaxBlockId(maxBlockId + 1);
-
-    return {"fail_count": fail_count, "total_count": total_count};
+function showErrorToast(message) {
+  const toastEl = document.getElementById('error-toast');
+  const textEl = document.getElementById('error-toast-text');
+  if (toastEl && textEl) {
+    textEl.textContent = message;
+    new bootstrap.Toast(toastEl).show();
+  }
 }
 
 /**
- * Given the current state of the nodes, selected dimension labels, generate more nodes in that space.
- * labels: Label[] -> {dimensionId, name, type}[]
+ * Thin wrapper around getEditorContext so internal call sites read naturally.
+ * All threshold/cache/summarisation logic lives in story-context.ts.
  */
-export async function growSpace(currBlockId, dimensionMap, labels, numResponses, prompt, nodeMap, setNodeMap){
-    // generate a list of requirements for each dimension
-    let {dimReqs, data} = genFilteredDimRequirements(dimensionMap, numResponses);
-    // let {dimReqs, data} = genLabelRequirements(dimensionMap, labels, numResponses);
-    // generate a response for each requirement
-    const startTime = Date.now();
-    let responses = [];
-    console.log("dimReqs", dimReqs);
-    const responsePromises = dimReqs.map(async (req) => {
-        // parse req to get id and requirements
-        const id = req["ID"];
-        const wordLimit = "Limit the response to 150 words.\n\n"
-        const requirements = req["Requirements"];
-        const message = wordLimit + editorBackgroundPrompt() + "Prompt: " + prompt + "\n" + DELIMITER + "\n" + "Requirements: " + requirements + "\n" + DELIMITER + "\n";
-        // Call the generateResponse function to generate a response for each requirement
-        const response = await generateResponse(message);
-        // store the response in the data
-        // let data: any;
-        data[id]["Prompt"] = message;
-        data[id]["Result"] = response;
-        const summary = await abstraction(response);
-        data[id]["Summary"] = summary["Summary"];
-        data[id]["Keywords"] = summary["Key Words"];
-        data[id]["Structure"] = summary["Structure"];
-        data[id]["Title"] = summary["Title"];
-        data[id]["IsMyFav"] = false;
+const editorBackgroundPrompt = getEditorContext;
+
+/**
+ * Builds the user-facing message for a creative generation call.
+ *
+ * Requirements are reformatted as a bulleted mandatory list so the model
+ * treats them as hard constraints rather than soft suggestions.
+ */
+function buildCreativeUserMessage(background, userPrompt, requirements) {
+  const backgroundSection = background
+    ? `Background context (incorporate naturally if relevant):\n${background}\n\n`
+    : '';
+
+  const reqLines = requirements
+    .trim()
+    .split('\n')
+    .filter((l) => l.trim())
+    .map((l) => `- ${l.trim()}`)
+    .join('\n');
+
+  return (
+    `${backgroundSection}Writing prompt: ${userPrompt}\n\n` +
+    `The following stylistic requirements are MANDATORY. Your response MUST unmistakably embody ` +
+    `ALL of them — a reader should be able to identify each requirement from the response alone ` +
+    `without being told:\n\n${reqLines}\n\n` +
+    `Respond in the form that best suits the prompt — prose, a list of ideas, plot hooks, ` +
+    `dialogue, story beats, or any other form it implies. ` +
+    `Keep your response under 150 words. Output only the response, no preamble or commentary.`
+  );
+}
+
+/**
+ * Builds the user message for the "More Like This" / variation case.
+ * Same requirements as the original but explicitly asks for different content.
+ */
+function buildVariationUserMessage(background, userPrompt, requirements) {
+  const backgroundSection = background
+    ? `Background context:\n${background}\n\n`
+    : '';
+
+  if (!requirements || requirements.trim() === '') {
+    return (
+      `${backgroundSection}Writing prompt: ${userPrompt}\n\n` +
+      `Respond in the form that best suits the prompt. ` +
+      `Keep your response under 150 words. Output only the response, no preamble or commentary.`
+    );
+  }
+
+  const reqLines = requirements
+    .trim()
+    .split('\n')
+    .filter((l) => l.trim())
+    .map((l) => `- ${l.trim()}`)
+    .join('\n');
+
+  return (
+    `${backgroundSection}Generate a VARIATION on the following writing prompt. ` +
+    `The variation must satisfy the same stylistic requirements but explore entirely different ` +
+    `content, angles, or approaches — it should feel genuinely distinct.\n\n` +
+    `Writing prompt: ${userPrompt}\n\n` +
+    `Mandatory stylistic requirements:\n${reqLines}\n\n` +
+    `Respond in the form that best suits the prompt. ` +
+    `Keep your response under 150 words. Output only the response, no preamble or commentary.`
+  );
+}
+
+// ─── Core generation ──────────────────────────────────────────────────────────
+
+/**
+ * Returns true when a model response looks like a clarification request or
+ * meta-refusal rather than creative output.  Requires at least two independent
+ * signals to avoid false positives from legitimate story content that happens
+ * to use words like "contradiction" or "option".
+ */
+function isMetaResponse(text) {
+  const t = text.toLowerCase();
+  const signals = [
+    t.includes('contradiction in the requirement'),
+    t.includes('cannot simultaneously'),
+    t.includes('mutually exclusive') && t.includes('constraint'),
+    t.includes('before i can'),
+    t.includes('please clarify'),
+    // "Option A ... Option B" pattern is a strong indicator of a clarification fork
+    /option a\b/.test(t) && /option b\b/.test(t),
+    t.includes('these two constraints'),
+    t.includes('which serves your story'),
+  ];
+  return signals.filter(Boolean).length >= 2;
+}
+
+async function generateResponse(userMessage, temperature = 0.9) {
+  let text;
+  try {
+    text = await callBedrock({
+      system: CREATIVE_WRITING_SYSTEM_PROMPT,
+      messages: [{ role: 'user', content: userMessage }],
+      temperature,
+      maxTokens: 512,
     });
-    await Promise.all(responsePromises);
-    const endTime = Date.now();
-    console.log("Time to generate " + numResponses + " responses: " + (endTime - startTime) + "ms");
-    setNodeMap({
-        ...nodeMap,
-        ...data,
-    })
-    DatabaseManager.addBatchData(currBlockId, data);
-    return {"fail_count": fail_count, "total_count": total_count};
+  } catch (error) {
+    fail_count++;
+    total_count++;
+    console.error('[generateResponse] API error:', error);
+    throw error;
+  }
+
+  total_count++;
+  const trimmed = text.trim();
+
+  if (isMetaResponse(trimmed)) {
+    fail_count++;
+    console.warn('[generateResponse] Meta-response discarded — model requested clarification instead of generating');
+    throw new Error('Non-creative meta-response');
+  }
+
+  return trimmed;
+}
+
+// ─── Summarisation ────────────────────────────────────────────────────────────
+
+// ─── Shared JSON Schemas ──────────────────────────────────────────────────────
+// All object types carry additionalProperties: false — Bedrock's structured
+// output rejects any value other than false (docs: "Supported JSON Schema
+// features" — additionalProperties set to anything other than false is NOT
+// supported and causes a 400 error).
+
+const SUMMARY_ITEM_SCHEMA = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['keywords', 'summary', 'structure', 'title'],
+  properties: {
+    keywords:  { type: 'array', items: { type: 'string' } },
+    summary:   { type: 'string' },
+    structure: { type: 'string' },
+    title:     { type: 'string' },
+  },
+};
+
+const BATCH_SUMMARY_SCHEMA = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['summaries'],
+  properties: {
+    summaries: {
+      type: 'array',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['keywords', 'summary', 'structure', 'title'],
+        properties: {
+          keywords:  { type: 'array', items: { type: 'string' } },
+          summary:   { type: 'string' },
+          structure: { type: 'string' },
+          title:     { type: 'string' },
+        },
+      },
+    },
+  },
+};
+
+const LABEL_MAP_SCHEMA = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['labels'],
+  properties: {
+    labels: { type: 'array', items: { type: 'string' } },
+  },
+};
+
+const ASSIGN_LABEL_SCHEMA = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['label'],
+  properties: { label: { type: 'string' } },
+};
+
+// ─── Summarisation ────────────────────────────────────────────────────────────
+
+/**
+ * Summarises an array of texts in a SINGLE Haiku call (structured output).
+ * Falls back to individual calls only if the batch call throws entirely.
+ */
+async function batchAbstraction(texts) {
+  if (texts.length === 0) return [];
+
+  const fragments = texts
+    .map((t, i) => `Fragment ${i + 1}:\n${t}`)
+    .join('\n\n---\n\n');
+
+  const userMessage =
+    `Analyse these ${texts.length} responses and extract metadata for each. ` +
+    `Responses may be prose, idea lists, plot hooks, dialogue, outlines, or other forms.\n\n` +
+    `${fragments}\n\n` +
+    `Return exactly ${texts.length} summary objects in order.\n` +
+    `For each:\n` +
+    `- keywords: up to 5 strings capturing dominant content, style, mood, or theme\n` +
+    `- summary: max 20 words capturing what this response contains and its distinctive angle\n` +
+    `- structure: the overall form or pattern (e.g. "prose", "bullet-list", "dialogue", "premise-hook-twist")\n` +
+    `- title: max 5 words, DISTINCTIVE — what makes this response unique, no quotes`;
+
+  try {
+    const result = await callBedrockStructured(
+      { system: SUMMARIZATION_SYSTEM_PROMPT, messages: [{ role: 'user', content: userMessage }], useHaiku: true, temperature: 0.2, maxTokens: 2048 },
+      BATCH_SUMMARY_SCHEMA,
+    );
+    const summaries = result.summaries;
+    if (Array.isArray(summaries) && summaries.length === texts.length) {
+      return summaries.map(normalizeSummary);
+    }
+    throw new Error(`Expected ${texts.length} items, got ${summaries?.length}`);
+  } catch (e) {
+    console.warn('[batchAbstraction] Falling back to individual summarisation:', e.message);
+    return Promise.all(texts.map((text) => abstraction(text)));
+  }
+}
+
+function normalizeSummary(s) {
+  return {
+    Keywords:  Array.isArray(s.keywords) ? s.keywords : [],
+    Summary:   s.summary   || '',
+    Structure: s.structure || '',
+    Title:     (s.title    || '').replace(/(^['<"])|(['>"]$)/g, ''),
+  };
+}
+
+/** Single-item summarisation — fallback from batchAbstraction. */
+export async function abstraction(text) {
+  try {
+    const result = await callBedrockStructured(
+      { system: SUMMARIZATION_SYSTEM_PROMPT, messages: [{ role: 'user', content: summarizeUserMessage(text) }], useHaiku: true, temperature: 0.2, maxTokens: 512 },
+      SUMMARY_ITEM_SCHEMA,
+    );
+    return normalizeSummary(result);
+  } catch (e) {
+    console.warn('[abstraction] failed:', e.message);
+    showErrorToast(`Summary generation failed: ${e.message}`);
+    return { Keywords: [], Summary: '', Structure: '', Title: '' };
+  }
+}
+
+function summarizeUserMessage(text) {
+  return (
+    `Extract metadata from the following response (which may be prose, a list of ideas, ` +
+    `dialogue, plot hooks, or another form):\n\n${text}\n\n` +
+    `keywords: up to 5 strings capturing dominant content, style, mood, or theme\n` +
+    `summary: max 20 words capturing what this response contains and its distinctive angle\n` +
+    `structure: the overall form or pattern (e.g. "prose", "bullet-list", "dialogue", "premise-hook-twist")\n` +
+    `title: max 5 words, DISTINCTIVE — captures what makes this response unique, no quotes`
+  );
+}
+
+// ─── Dimension-requirement helpers ────────────────────────────────────────────
+
+function genDimRequirements(dimensions, numResponses) {
+  let dimReqs = [];
+  let data = {};
+  for (let i = 0; i < numResponses; i++) {
+    let req = '';
+    const datum = { ID: uuid(), Dimension: { categorical: {}, numerical: {}, ordinal: {} } };
+
+    if (useResponseStore.getState().responseId === null) {
+      useResponseStore.getState().setResponseId(datum.ID);
+      useCurrStore.getState().setCurrDataId(datum.ID);
+    }
+
+    Object.entries(dimensions.categorical || {}).forEach(([d, v]) => {
+      const randVal = v[Math.floor(Math.random() * v.length)];
+      req += `${d}: ${randVal}\n`;
+      datum.Dimension.categorical[d] = randVal;
+    });
+    Object.entries(dimensions.ordinal || {}).forEach(([d, v]) => {
+      const randVal = v[Math.floor(Math.random() * v.length)];
+      req += `${d}: ${randVal}\n`;
+      datum.Dimension.ordinal[d] = randVal;
+    });
+
+    dimReqs.push({ ID: datum.ID, Requirements: req });
+    data[datum.ID] = datum;
+  }
+  return { dimReqs, data };
+}
+
+function genFilteredDimRequirements(dimensionMap, numResponses) {
+  let dimReqs = [];
+  let data = {};
+  for (let i = 0; i < numResponses; i++) {
+    let req = '';
+    const datum = { ID: uuid(), Dimension: { categorical: {}, numerical: {}, ordinal: {} } };
+
+    Object.values(dimensionMap).forEach((dimension) => {
+      const values =
+        dimension.filtered && dimension.filtered.length > 0
+          ? dimension.filtered
+          : dimension.values;
+      const randVal = values[Math.floor(Math.random() * values.length)];
+      req += `${dimension.name}: ${randVal}\n`;
+      datum.Dimension[dimension.type][dimension.name] = randVal;
+    });
+
+    dimReqs.push({ ID: datum.ID, Requirements: req });
+    data[datum.ID] = datum;
+  }
+  return { dimReqs, data };
+}
+
+function genLabelDimRequirements(dimensionMap, label, numResponses) {
+  let dimReqs = [];
+  let data = {};
+  for (let i = 0; i < numResponses; i++) {
+    let req = '';
+    const datum = { ID: uuid(), Dimension: { categorical: {}, numerical: {}, ordinal: {} } };
+
+    Object.values(dimensionMap).forEach((dimension) => {
+      const values =
+        dimension.id === label.dimensionId ? [label.name] : dimension.values;
+      const randVal = values[Math.floor(Math.random() * values.length)];
+      req += `${dimension.name}: ${randVal}\n`;
+      datum.Dimension[dimension.type][dimension.name] = randVal;
+    });
+
+    dimReqs.push({ ID: datum.ID, Requirements: req });
+    data[datum.ID] = datum;
+  }
+  return { dimReqs, data };
+}
+
+// ─── Space-building functions ─────────────────────────────────────────────────
+
+/**
+ * Generates the initial full design space.
+ *
+ * Architecture: parallel response generation → single batch summarisation call.
+ * Previously, each response triggered its own summarisation call (N calls).
+ * Now N responses → 1 summarisation call (Haiku), cutting API costs dramatically.
+ */
+export async function buildSpace(currBlockId, dimensions, numResponses, prompt, context) {
+  const { dimReqs, data } = genDimRequirements(dimensions, numResponses);
+  const { maxBlockId, setMaxBlockId } = useCurrStore.getState();
+  const { setSelectedResponse } = useSelectedStore.getState();
+
+  fail_count = 0;
+  total_count = dimReqs.length;
+  firstId = dimReqs[0]?.ID ?? '';
+
+  // Await the editor background ONCE (previously called without await — bug fix)
+  // Pass the inline context (selected text) so it also reaches the generation prompt
+  const background = await editorBackgroundPrompt(context);
+
+  const BATCH_SIZE = 20;
+  for (let i = 0; i < dimReqs.length; i += BATCH_SIZE) {
+    const batch = dimReqs.slice(i, i + BATCH_SIZE);
+
+    // Phase 1 — generate all responses in parallel
+    const batchResults = await Promise.all(
+      batch.map(async (req) => {
+        try {
+          const userMessage = buildCreativeUserMessage(background, prompt, req.Requirements);
+          const response = await generateResponse(userMessage);
+          return { id: req.ID, requirements: req.Requirements, userMessage, response, ok: true };
+        } catch (err) {
+          console.error(`[buildSpace] response error for ${req.ID}:`, err);
+          fail_count++;
+          // Ensure the node has all required fields so the visualisation never
+          // crashes on undefined Keywords / Title etc.
+          data[req.ID] = {
+            ...data[req.ID],
+            Prompt: '', UserPrompt: prompt, Requirements: req.Requirements,
+            Context: context, Result: '', IsMyFav: false,
+            Summary: '', Keywords: [], Structure: '', Title: '(failed)',  // Keywords already correct
+          };
+          return { id: req.ID, ok: false };
+        }
+      }),
+    );
+
+    const successful = batchResults.filter((r) => r.ok);
+
+    // Phase 2 — batch summarise (single Haiku call)
+    const summaries = await batchAbstraction(successful.map((r) => r.response));
+
+    // Phase 3 — assemble node data
+    successful.forEach(({ id, requirements, userMessage, response }, idx) => {
+      const summary = summaries[idx] ?? { Keywords: [], Summary: '', Structure: '', Title: '' };
+      data[id] = {
+        ...data[id],
+        Prompt: userMessage,
+        UserPrompt: prompt,     // stored for "More Like This" variation calls
+        Requirements: requirements,
+        Context: context,
+        Result: response,
+        IsMyFav: false,
+        Summary: summary.Summary,
+        Keywords: summary.Keywords,
+        Structure: summary.Structure,
+        Title: summary.Title,
+      };
+      if (id === firstId) setSelectedResponse(currBlockId, data[id]);
+      if (id === useResponseStore.getState().responseId) {
+        useResponseStore.getState().setResponse(response);
+      }
+    });
+  }
+
+  DatabaseManager.putAllData(currBlockId, data);
+  useCurrStore.getState().setCurrBlockId(currBlockId);
+  setMaxBlockId(maxBlockId + 1);
+
+  return { fail_count, total_count };
+}
+
+export async function growSpace(currBlockId, dimensionMap, labels, numResponses, prompt, nodeMap, setNodeMap) {
+  const { dimReqs, data } = genFilteredDimRequirements(dimensionMap, numResponses);
+  const inlineContext = useResponseStore.getState().context ?? '';
+  const background = await editorBackgroundPrompt(inlineContext);
+
+  // Phase 1 — generate responses in parallel
+  const responseResults = await Promise.all(
+    dimReqs.map(async (req) => {
+      try {
+        const userMessage = buildCreativeUserMessage(background, prompt, req.Requirements);
+        const response = await generateResponse(userMessage);
+        return { id: req.ID, requirements: req.Requirements, userMessage, response, ok: true };
+      } catch (err) {
+        console.error('[growSpace] response error:', err);
+        fail_count++;
+        return { id: req.ID, ok: false };
+      }
+    }),
+  );
+
+  const successful = responseResults.filter((r) => r.ok);
+
+  // Phase 2 — batch summarise
+  const summaries = await batchAbstraction(successful.map((r) => r.response));
+
+  // Phase 3 — assemble
+  successful.forEach(({ id, requirements, userMessage, response }, idx) => {
+    const summary = summaries[idx] ?? { Keywords: [], Summary: '', Structure: '', Title: '' };
+    data[id] = {
+      ...data[id],
+      Prompt: userMessage,
+      UserPrompt: prompt,
+      Requirements: requirements,
+      Result: response,
+      Summary: summary.Summary,
+      Keywords: summary.Keywords,
+      Structure: summary.Structure,
+      Title: summary.Title,
+      IsMyFav: false,
+    };
+  });
+
+  setNodeMap({ ...nodeMap, ...data });
+  DatabaseManager.addBatchData(currBlockId, data);
+  return { fail_count, total_count };
 }
 
 export async function addLabelToSpace(dimensionMap, newLabel, numResponses, prompt, nodeMap, setNodeMap) {
-        // generate a list of requirements for each dimension
-        let {dimReqs, data} = genLabelDimRequirements(dimensionMap, newLabel, numResponses);
-        // let {dimReqs, data} = genLabelRequirements(dimensionMap, labels, numResponses);
-        const {maxBlockId, setMaxBlockId} = useCurrStore.getState();
-        // generate a response for each requirement
-        const startTime = Date.now();
-        let responses = [];
-        console.log("dimReqs", dimReqs);
-        const responsePromises = dimReqs.map(async (req) => {
-            // parse req to get id and requirements
-            const id = req["ID"];
-            const wordLimit = "Limit the response to 150 words.\n####\n"
-            const requirements = req["Requirements"];
-            const message = wordLimit + editorBackgroundPrompt() + "Prompt: " + prompt + "\n" + DELIMITER + "\n" + "Requirements: " + requirements + "\n" + DELIMITER + "\n";
-            // Call the generateResponse function to generate a response for each requirement
-            const response = await generateResponse(message);
-            // store the response in the data
-            // let data: ResponseData = {};
-            data[id]["Prompt"] = message;
-            data[id]["Result"] = response;
-            const summary = await abstraction(response);
-            data[id]["Summary"] = summary["Summary"];
-            data[id]["Keywords"] = summary["Key Words"];
-            data[id]["Structure"] = summary["Structure"];
-            data[id]["Title"] = summary["Title"];
-            data[id]["IsMyFav"] = false;
-        });
-        await Promise.all(responsePromises);
-        const endTime = Date.now();
-        console.log("Time to generate " + numResponses + " responses: " + (endTime - startTime) + "ms");
-        console.log(data);
-    
-        setNodeMap({
-            ...nodeMap,
-            ...data,
-        })
-        const {currBlockId} = useCurrStore.getState();
-        DatabaseManager.addBatchData(currBlockId, data);
-        return {"fail_count": fail_count, "total_count": total_count};
-}
+  const { dimReqs, data } = genLabelDimRequirements(dimensionMap, newLabel, numResponses);
+  const { currBlockId } = useCurrStore.getState();
+  const inlineContext = useResponseStore.getState().context ?? '';
+  const background = await editorBackgroundPrompt(inlineContext);
 
-/**
- * Given the current state of the nodes, selected dimension labels, generate more nodes in that space.
- * labels: Label[] -> {dimensionId, name, type}[]
- */
-export async function addSimilarNodesToSpace(node, nodeMap, setNodeMap){
-    // generate a response for each requirement
-    const startTime = Date.now();
-    const data = {};
-    // let data: ResponseData = {};
-    const responsePromises = [0,1,2,3,4].map(async (i) => {
-        // parse req to get id and requirements
-        const id = uuid();
-        const wordLimit = "Limit the response to 150 words.\n\n"
-        const message = wordLimit + editorBackgroundPrompt() + "Prompt: " + node.Prompt;
-        // Call the generateResponse function to generate a response for each requirement
-        const response = await generateResponse(message);
-        // store the response in the data
-        data[id] = {
-            ...node,
-            ID: id,
-        }
-        data[id]["Prompt"] = message;
-        data[id]["Result"] = response;
-        const summary = await abstraction(response);
-        data[id]["Summary"] = summary["Summary"];
-        data[id]["Keywords"] = summary["Key Words"];
-        data[id]["Structure"] = summary["Structure"];
-        data[id]["Title"] = summary["Title"];
-        data[id]["IsMyFav"] = false;
-        data[id]["IsNew"] = true; // when generting dots via see more
-    });
-    await Promise.all(responsePromises);
-    const endTime = Date.now();
-    console.log(data)
-    setNodeMap({
-        ...nodeMap,
-        ...data,
-    })
-    const {currBlockId} = useCurrStore.getState();
-    DatabaseManager.addBatchData(currBlockId, data);
-    return {"fail_count": fail_count, "total_count": total_count};
-}
+  // Phase 1 — generate responses in parallel
+  const responseResults = await Promise.all(
+    dimReqs.map(async (req) => {
+      try {
+        const userMessage = buildCreativeUserMessage(background, prompt, req.Requirements);
+        const response = await generateResponse(userMessage);
+        return { id: req.ID, requirements: req.Requirements, userMessage, response, ok: true };
+      } catch (err) {
+        console.error('[addLabelToSpace] response error:', err);
+        fail_count++;
+        return { id: req.ID, ok: false };
+      }
+    }),
+  );
 
+  const successful = responseResults.filter((r) => r.ok);
 
-async function generateResponse(message){
-    // call the OpenAI API to generate a response
-    try{
-        /* text-davinci-003 */
-        const response = await fetch('https://api.openai.com/v1/completions', {
-            method: 'POST',
-            headers: {
-            Authorization: `Bearer ${getEnvVal('VITE_OPENAI_API_KEY')}`,
-            'Content-Type': 'application/json',
-            },
-            body: JSON.stringify({
-            model: MODEL,
-            prompt: `${message}`,
-            temperature: 0,
-            max_tokens: MAX_TOKEN_BIG,
-            top_p: TOP_P,
-            frequency_penalty: 0.75,
-            presence_penalty: 0,
-            stream: false
-            }),
-        });
-        const reader = response.body?.pipeThrough(new TextDecoderStream()).getReader();
-        if (!reader) {
-            throw new Error('No reader found');
-        }
-        const {value, done} = await reader.read();
-        total_count += 1; // increment total count
-        if (value){
-            return JSON.parse(value)["choices"][0]["text"];
-        } else {
-            throw new Error('No value found');
-        }
-    } catch (error) {
-        fail_count += 1; // increment fail count
-        total_count += 1; // increment total count
-        console.log(error);
-        return "Error";
-    }
-}
+  // Phase 2 — batch summarise
+  const summaries = await batchAbstraction(successful.map((r) => r.response));
 
-
-function genDimRequirements(dimensions, numResponses){
-    // generate a list of requirements for each dimension
-    // return a list of requirements
-    // **** IMPORTANT ****
-    // the ID of the requirement is the (index + 1) of the requirement in the list
-    let dimReqs = [];
-    let data = {};
-    for (let i = 0; i < numResponses; i++){
-        let req = ""
-        let datum = {};
-        datum["ID"] = uuid();
-        if ( useResponseStore.getState().responseId === null){
-            useResponseStore.getState().setResponseId(datum["ID"]);
-            useCurrStore.getState().setCurrDataId(datum["ID"]);
-
-        }
-        datum["Dimension"] = {"categorical": {}, "numerical": {}, "ordinal": {}};
-        Object.entries(dimensions["categorical"]).forEach(([d, v]) => {
-            // choose a random value from v
-            let randVal = v[Math.floor(Math.random() * v.length)];
-            req += d + ": " + randVal + "\n";
-            datum["Dimension"]["categorical"][d] = randVal;
-        });
-        /* Comemnt out this part if you don't want ordinal dimension */
-        Object.entries(dimensions["ordinal"]).forEach(([d, v]) => {
-            // choose a random value from v
-            let randVal = v[Math.floor(Math.random() * v.length)];
-            req += d + ": " + randVal + "\n";
-            datum["Dimension"]["ordinal"][d] = randVal;
-        });
-        dimReqs.push({"ID": datum["ID"], "Requirements": req});
-        data[datum["ID"]] = datum;
-    }
-    return {dimReqs, data};
-}
-
-function genFilteredDimRequirements(dimensionMap, numResponses){
-    // generate a list of requirements for each dimension
-    // return a list of requirements
-    // **** IMPORTANT ****
-    // the ID of the requirement is the (index + 1) of the requirement in the list
-    let dimReqs = [];
-    let data = {};
-    // console.log("numResponse", numResponses);
-    for (let i = 0; i < numResponses; i++){
-        let req = ""
-        let datum = {};
-        datum["ID"] = uuid();
-        datum["Dimension"] = {"categorical": {}, "numerical": {}, "ordinal": {}};
-        Object.values(dimensionMap).forEach((dimension) => {
-            let values = [];
-            if (dimension.filtered && dimension.filtered.length > 0) {
-                values = dimension.filtered;
-            } else {
-                values = dimension.values;
-            }
-            let randVal = values[Math.floor(Math.random() * values.length)];
-            req += dimension.name + ": " + randVal + "\n";
-            datum["Dimension"][dimension.type][dimension.name] = randVal;
-        })
-        console.log(req)
-        dimReqs.push({"ID": datum["ID"], "Requirements": req});
-        data[datum["ID"]] = datum;
-    }
-    return {dimReqs, data};
-}
-
-/**
- * Hardcoded to add one new label
- */
-function genLabelDimRequirements(dimensionMap, label, numResponses){
-    // generate a list of requirements for each dimension
-    // return a list of requirements
-    // **** IMPORTANT ****
-    // the ID of the requirement is the (index + 1) of the requirement in the list
-    let dimReqs = [];
-    let data = {};
-    // console.log("numResponse", numResponses);
-    for (let i = 0; i < numResponses; i++){
-        let req = ""
-        let datum = {};
-        datum["ID"] = uuid();
-        datum["Dimension"] = {"categorical": {}, "numerical": {}, "ordinal": {}};
-        Object.values(dimensionMap).forEach((dimension) => {
-            let values = [];
-            if (dimension.id === label.dimensionId) {
-                values = [label.name]
-            } else {
-                values = dimension.values;
-            }
-            let randVal = values[Math.floor(Math.random() * values.length)];
-            req += dimension.name + ": " + randVal + "\n";
-            datum["Dimension"][dimension.type][dimension.name] = randVal;
-        })
-        console.log(req)
-        dimReqs.push({"ID": datum["ID"], "Requirements": req});
-        data[datum["ID"]] = datum;
-    }
-    return {dimReqs, data};
-}
-
-export async function abstraction(text){
-  let response = await summarizeText(text);
-  response = response.substring(response.indexOf("{"), response.lastIndexOf("}") + 1);
-
-  for (let i = 0; i < 5; i++){
-    if (validateFormatForSummarization(response)) {
-        const responseJson = JSON.parse(response);
-        // using regular expression to remove the '' or <> before and after first and last letter in title
-        responseJson["Title"] = responseJson["Title"].replace(/(^['<])|(['>]$)/g, '');
-        return {"Key Words": responseJson["Key Words"], "Summary": responseJson["Summary"], "Structure": responseJson["Structure"], "Title": responseJson["Title"]};
+  // Phase 3 — assemble
+  successful.forEach(({ id, requirements, userMessage, response }, idx) => {
+    const summary = summaries[idx] ?? { Keywords: [], Summary: '', Structure: '', Title: '' };
+    data[id] = {
+      ...data[id],
+      Prompt: userMessage,
+      UserPrompt: prompt,
+      Requirements: requirements,
+      Result: response,
+      Summary: summary.Summary,
+      Keywords: summary.Keywords,
+      Structure: summary.Structure,
+      Title: summary.Title,
+      IsMyFav: false,
     };
-    response =  await summarizeText(text);
-    response = response.substring(response.indexOf("{"), response.lastIndexOf("}") + 1);
-  }
-  // did not get a valid response after 5 tries
-  // make toasts to notify the user
-    var toast = new bootstrap.Toast(document.getElementById('error-toast'));
-    document.getElementById('error-toast-text').textContent = "Error: Failed to generate the summary. Please try again.";
-    toast.show();
-    return {"Key Words": [], "Summary": "", "Structure": "", "Title": ""};
-  
+  });
+
+  setNodeMap({ ...nodeMap, ...data });
+  DatabaseManager.addBatchData(currBlockId, data);
+  return { fail_count, total_count };
 }
-
-async function summarizeText(text){
-    const message = `Given following text, return key words and a one sentence summary, a structure , and a title of the text.
-      ####
-      Text is: ${text}
-      ####
-      Don't include any text other than the json
-      Word limit of the summary text is 20 words
-      Word limit of the title is 5 words
-      Maximum 5 key words
-      ####
-      Should be in the following JSON format: 
-      {
-          "Key Words": ["<key word 1>", "<key word 2>", ...], 
-          "Summary": "<summary>",
-          "Structure": "<part 1>-<part 2>-<part 3>...",
-          "Title": "<title>"
-      }`;
-    const response = await fetch('https://api.openai.com/v1/completions', {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${getEnvVal('VITE_OPENAI_API_KEY')}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        model: MODEL,
-        prompt: `${message}`,
-        temperature: 0,
-        max_tokens: 256,
-        top_p: TOP_P,
-        frequency_penalty: 0.75,
-        presence_penalty: 0,
-      }),
-    });
-    const reader = response.body?.pipeThrough(new TextDecoderStream()).getReader();
-    if (!reader) {
-        throw new Error('No reader found');
-    }
-    const {value, done} = await reader.read();
-    // console.log("text summary",JSON.parse(value)["choices"][0]["text"]);
-    if (value){
-        return JSON.parse(value)["choices"][0]["text"];
-    } else {
-        throw new Error('No value found');
-    }
-  }
-
-/*  validate the format of the response
-    return true if the response is in the correct format
-    return false if the response is not in the correct format 
-*/
-function validateFormatForSummarization(response){
-    try {
-        // check if the response is in the JSON format
-        // only care about the text in between the {}
-        const result = JSON.parse(response);
-        // console.log("result format",result);
-        //  check if there are any infinities or NaNs
-        for (const [key, value] of Object.entries(result)) {
-            if (key !== "Summary" && key !== "Structure" && key !== "Key Words" && key !== "Title"){
-                console.log("invalid key", key);
-                return false;
-            }
-            // check if the value in Key Words is a list
-            if (key === "Key Words"){
-                if (!Array.isArray(value)){
-                    console.log("invalid value", value);
-                    return false;
-                }
-            }
-        }
-        total_count += 1; // increment total count
-        return true
-    }
-    catch (e) {
-        console.log(e);
-        fail_count += 1; // increment fail count
-        total_count += 1; // increment total count
-        return false
-    }
-  }
-
-
-/*validate the format of the response
-  return true if the response is in the correct format
-  return false if the response is not in the correct format
-*/
-export function validateFormatForAddingDimensions(response){
-    try {
-        // check if the response is in the JSON format
-        const result =  JSON.parse(response);
-        // check if the number of dimensions is correct
-        return true;
-        
-    }
-    catch (e) {
-        console.log("[Error] " + e, response);
-        if (isLast){
-          var toast = new bootstrap.Toast(document.getElementById('error-toast'));
-          const err = document.getElementById('error-toast-text');
-          if (err) {
-            err.textContent = "Encountered errors when parsing the JSON response from OpenAI";
-            toast.show();
-          }
-        }
-        return false
-    }
-  }
 
 /**
- * Given the current dimensions, generate a brand new dimension and its labels.
- * For each response, select a random value of the dimension.
- * Update that response to also include that dimension label.
- * abstraction() of that new response
- * 
- * 
- * Not doing this: Then, for each response, apply one of the dimension labels to the current response.
- * 
+ * "More Like This" — generates 5 variations that share the same requirements
+ * but explore different content/angles.  Temperature raised to 1.0 for maximum
+ * variation.
  */
+export async function addSimilarNodesToSpace(node, nodeMap, setNodeMap) {
+  const background = await editorBackgroundPrompt();
+
+  // Fall back gracefully for nodes created before UserPrompt/Requirements were stored
+  const userPrompt = node.UserPrompt || node.Prompt || '';
+  const requirements = node.Requirements || '';
+
+  const responseResults = await Promise.allSettled(
+    [0, 1, 2, 3, 4].map(async () => {
+      const id = uuid();
+      const userMessage = buildVariationUserMessage(background, userPrompt, requirements);
+      const response = await generateResponse(userMessage, 1.0);
+      return { id, userMessage, response };
+    }),
+  );
+
+  const successful = responseResults
+    .filter((r) => r.status === 'fulfilled')
+    .map((r) => r.value);
+
+  const summaries = await batchAbstraction(successful.map((r) => r.response));
+
+  const data = {};
+  successful.forEach(({ id, userMessage, response }, idx) => {
+    const summary = summaries[idx] ?? { Keywords: [], Summary: '', Structure: '', Title: '' };
+    data[id] = {
+      ...node,
+      ID: id,
+      Prompt: userMessage,
+      UserPrompt: userPrompt,
+      Requirements: requirements,
+      Result: response,
+      Summary: summary.Summary,
+      Keywords: summary.Keywords,
+      Structure: summary.Structure,
+      Title: summary.Title,
+      IsMyFav: false,
+      IsNew: true,
+    };
+  });
+
+  setNodeMap({ ...nodeMap, ...data });
+  const { currBlockId } = useCurrStore.getState();
+  DatabaseManager.addBatchData(currBlockId, data);
+  return { fail_count, total_count };
+}
+
+// ─── Add New Dimension ────────────────────────────────────────────────────────
+
 export async function addNewDimension(prompt, dimensionName, dimensionMap, setDimensionMap, nodeMap, setNodeMap) {
-    let newDimResponse = await createLabelsFromDimension(prompt, dimensionName);
-    let newDimension = null;
-    for (let i = 0; i < 5; i++){
-        if (validateFormatForAddingDimensions(newDimResponse)) {
-            newDimension = JSON.parse(newDimResponse);
-            break
-        };
-        newDimResponse = await createLabelsFromDimension(prompt, dimensionName)
+  // Step 1 — generate labels (tool use returns an object directly, no JSON.parse needed)
+  let newDimension = null;
+  for (let i = 0; i < 3; i++) {
+    try {
+      const result = await createLabelsFromDimension(prompt, dimensionName);
+      if (validateFormatForAddingDimensions(result)) {
+        newDimension = result;
+        break;
+      }
+    } catch (e) {
+      console.warn('[addNewDimension] label generation attempt', i, e.message);
     }
-    // separate the dimension name and values
-    if (!newDimension) {
-        console.log('failed add new dimension. Please try again.');
-        var toast = new bootstrap.Toast(document.getElementById('error-toast'));
-        var msg = document.getElementById('error-toast-text');
-        if (msg) {
-            msg.textContent = "Failed add a new dimension. Please try again.";
-            toast.show();
-        }
-        return;
-    }
-    var toast = new bootstrap.Toast(document.getElementById('fav-toast'));
-    var msg = document.getElementById('toast-text');
-      if (msg) {
-        msg.textContent = "New dimension added.";
-        toast.show();
-    }
+  }
 
-
-    const name = Object.keys(newDimension)[0];
-    const values = Object.values(newDimension)[0];
-
-    // Add dimension to dimension Map
-    dimensionMap[name] = {
-        id: Object.keys(dimensionMap).length,
-        name: name,
-        type: "categorical",
-        values: values,
-        filtered: [],
-    }
-    setDimensionMap(dimensionMap);
-    console.log("dimensionMap", dimensionMap);
-    // update dimensiosn in the local storage
-    const newDimensionToStore = {
-        "name": name,
-        "type": "categorical",
-        "values": values,
-    }
-    const {currBlockId} = useCurrStore.getState();
-    DatabaseManager.postDimension(currBlockId, name, newDimensionToStore) 
-
-    // for each response, run reviseResponseWithNewDimensionLabel
-    const assignLabelPrompt = 
-        `\nThis is the newly added dimension: ${dimensionName}
-        ####
-        these are the dimension values: [${values.join(', ')}]
-        ####
-        Assign a value from the dimension ${dimensionName} to the following response.`
-    const data = {};
-    const responsePromises = Object.entries(nodeMap).map(async ([id, node], i) => {
-        try{
-            const wordLimit = "Limit the response to 150 words."
-            const formatReq = `
-            ####
-            answer in the following JSON format: 
-            {
-                "label": "<label>"
-            }`
-            const assignLabelMessage = "Prompt: " + assignLabelPrompt + "####" + "Current response: " + node["Result"]+ "####" + formatReq;
-            var labelResponse = await generateResponse(assignLabelMessage);
-            var label = "";
-            for (let i = 0; i < 5; i++){
-                try {
-                    label = JSON.parse(labelResponse)["label"];
-                    break;
-                } catch (error) {
-                    labelResponse = await generateResponse(assignLabelMessage);
-                }
-            }
-            // parse the response to get the dimension label
-            const reviseResponsePrompt = `Revise this response such that it shows ${label} in the sense of ${dimensionName}.`;
-            const reviseResponseMessage = wordLimit + "####" + "Prompt: " + reviseResponsePrompt + "####" + "Current response: " + node["Result"];
-            var result = await generateResponse(reviseResponseMessage);
-            result = result.trim();
-            const summary = await abstraction(result);
-            // add the new label to the Dimension - categorical
-            node["Dimension"]["categorical"][dimensionName] = label;
-            data[id] = {
-                ...node,
-                ID: id,
-                Result: result,
-                Summary: summary["Summary"],
-                Keywords: summary["Key Words"],
-                Structure: summary["Structure"],
-                Title: summary["Title"],
-            }
-        } catch (error) {
-            console.log(error);
-            return;
-        }
-    })
-     await Promise.allSettled(responsePromises);
-    setNodeMap({
-        ...data,
-    });
-
-    // get all the data from the local storage
-    // DatabaseManager.getAllData(currBlockId);
-    // update the data in the local storage
-
-    // show a toast to notify the user
-    DatabaseManager.addBatchData(currBlockId, data);
-    var toast = new bootstrap.Toast(document.getElementById('fav-toast'));
-    msg = document.getElementById('toast-text');
-      if (msg) {
-        msg.textContent = "Current responses updated.";
-        toast.show();
-    }
+  if (!newDimension) {
+    showErrorToast('Failed to add new dimension. Please try again.');
     return;
+  }
 
+  new bootstrap.Toast(document.getElementById('fav-toast')).show();
+  document.getElementById('toast-text').textContent = 'New dimension added.';
+
+  const name = Object.keys(newDimension)[0];
+  const values = Object.values(newDimension)[0];
+
+  // Register dimension
+  dimensionMap[name] = { id: Object.keys(dimensionMap).length, name, type: 'categorical', values, filtered: [] };
+  setDimensionMap(dimensionMap);
+  const { currBlockId } = useCurrStore.getState();
+  DatabaseManager.postDimension(currBlockId, name, { name, type: 'categorical', values });
+
+  // Step 2 — for each existing node: assign a label then revise the response
+  const data = {};
+  await Promise.allSettled(
+    Object.entries(nodeMap).map(async ([id, node]) => {
+      try {
+        // 2a — label assignment (Haiku, cheap classification)
+        const assignMessage =
+          `Assign exactly one label from the list to the following creative writing piece.\n\n` +
+          `Dimension: ${dimensionName}\n` +
+          `Available labels: ${values.join(', ')}\n\n` +
+          `Creative writing:\n${node.Result}\n\n` +
+          `Select the single best-fitting label.`;
+
+        const labelResult = await callBedrockStructured(
+          { system: LABEL_SYSTEM_PROMPT, messages: [{ role: 'user', content: assignMessage }], useHaiku: true, temperature: 0.2, maxTokens: 128 },
+          ASSIGN_LABEL_SCHEMA,
+        );
+        const label = labelResult.label || values[0];
+
+        // 2b — revision (Sonnet, creative rewrite)
+        const reviseMessage =
+          `Revise the following response so that it clearly and unmistakably embodies ` +
+          `"${label}" in the dimension of "${dimensionName}". ` +
+          `Preserve the general form and approximate length of the original (under 150 words). ` +
+          `The dimension quality must be evident throughout, not just in one line.\n\n` +
+          `Original:\n${node.Result}\n\n` +
+          `Output only the revised response.`;
+
+        const revised = await callBedrock({
+          system: CREATIVE_WRITING_SYSTEM_PROMPT,
+          messages: [{ role: 'user', content: reviseMessage }],
+          temperature: 0.85,
+          maxTokens: 512,
+        });
+
+        const result = revised.trim();
+        const summary = await abstraction(result);
+
+        node.Dimension.categorical[dimensionName] = label;
+        data[id] = {
+          ...node,
+          ID: id,
+          Result: result,
+          Summary: summary.Summary,
+          Keywords: summary.Keywords,
+          Structure: summary.Structure,
+          Title: summary.Title,
+        };
+      } catch (err) {
+        console.error('[addNewDimension] node error:', err);
+      }
+    }),
+  );
+
+  setNodeMap({ ...data });
+  DatabaseManager.addBatchData(currBlockId, data);
+
+  const toast2 = new bootstrap.Toast(document.getElementById('fav-toast'));
+  document.getElementById('toast-text').textContent = 'Current responses updated.';
+  toast2.show();
 }
 
-/*
- * Create new labels for a given dimension
- */
-async function createLabelsFromDimension(prompt, dimensionName){
-    const message =  `Given a dimension name, return a list of labels for that dimension for the prompt ${prompt}
-    ####
-    Dimension name is: ${dimensionName}
-    ####
-    answer in the following JSON format: 
-    {
-        "${dimensionName}": ["<label 1>", "<label 2>", "<label 3>"]
-    }`;
+async function createLabelsFromDimension(prompt, dimensionName) {
+  const userMessage =
+    `Generate 5-6 distinct, meaningful labels for the creative writing dimension "${dimensionName}", ` +
+    `for pieces about:\n\n${prompt}\n\n` +
+    `Labels must:\n` +
+    `- Be concrete and mutually distinct from each other\n` +
+    `- Span the full range of what "${dimensionName}" could represent\n` +
+    `- Be useful as creative descriptors for writers`;
 
-    const response = await fetch('https://api.openai.com/v1/completions', {
-        method: 'POST',
-        headers: {
-          Authorization: `Bearer ${getEnvVal('VITE_OPENAI_API_KEY')}`,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          model: MODEL,
-          prompt: `${message}`,
-          temperature: TEMPERATURE,
-          max_tokens: MAX_TOKEN_BIG,
-          top_p: TOP_P,
-          frequency_penalty: 0.75,
-          presence_penalty: 0,
-          stream: false
-        }),
-      });
-    const reader = response.body?.pipeThrough(new TextDecoderStream()).getReader();
-    if (!reader) {
-        throw new Error('No reader found');
-    }
-    const {value, done} = await reader.read();
-    if (value){
-        console.log("value", JSON.parse(value)["choices"][0]["text"]);
-        return JSON.parse(value)["choices"][0]["text"];
-    } else {
-        throw new Error('No value found');
-    }
+  const result = await callBedrockStructured(
+    { system: LABEL_SYSTEM_PROMPT, messages: [{ role: 'user', content: userMessage }], temperature: 0.6, maxTokens: 512 },
+    LABEL_MAP_SCHEMA,
+  );
+  // Reconstruct the {dimensionName: [labels]} shape the rest of addNewDimension expects
+  return { [dimensionName]: result.labels };
 }
 
-
-
-
-
+export function validateFormatForAddingDimensions(response) {
+  return response !== null && typeof response === 'object';
+}

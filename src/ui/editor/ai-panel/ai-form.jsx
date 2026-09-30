@@ -179,9 +179,6 @@ export default function AiForm({responseHandler, selectedContent}) {
     useEffect(() => {
         if (response && query !== '') {
             setGenerationState("space");
-            // Add the response to the blocks
-            handleResponseFromAiForm({"text": response,"query":query, "id": currBlockId, "resId": responseId, "context": context});
-            // reset the responseId to null
             useResponseStore.setState({responseId: null});
         }
     }, [response]);
@@ -196,28 +193,6 @@ export default function AiForm({responseHandler, selectedContent}) {
             document.getElementById('context-div').classList.remove('show');
         }
     }, [context]);
-
-      const handleResponseFromAiForm = (response) => {
-        // Check if the Editor.js instance is available
-        try{
-            const blockToAdd = {
-                type: 'AiTool', 
-                data: {
-                  text: response.text,
-                  id: response.id,
-                  query: response.query,
-                  context: response.context,
-                  resId: response.resId,
-                //   aiPanelRef: response.aiPanelRef
-                }
-            };
-            api.blocks.insert(blockToAdd.type, blockToAdd.data, null, api.blocks.getBlocksCount());
-    
-        }
-        catch (error) {
-            console.log("[Error] error when inserting the block", error);
-        }
-    };
 
     return (
         // <div ref={aiPanelRef} style={{ width: '100%' , margin: 'auto'}}>
